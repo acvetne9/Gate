@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="prefetch" href="/demo" />
+    <title>Gate - Bot Protection & Content Security</title>
+
+    <!-- Early theme init: set `dark` class before React mounts to avoid FOUC -->
+    <script>
+      (function() {
+        try {
+          var saved = null;
+          try { saved = localStorage.getItem('theme'); } catch(e) { saved = null }
+          if (saved === 'dark' || saved === 'light') {
+            if (saved === 'dark') document.documentElement.classList.add('dark');
+            else document.documentElement.classList.remove('dark');
+            return;
+          }
+
+          var mql = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)');
+          var prefersDark = mql ? mql.matches : false;
+          if (prefersDark) document.documentElement.classList.add('dark');
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
