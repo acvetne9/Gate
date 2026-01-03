@@ -1,0 +1,13 @@
+project_id = "bakzzkadgmyvvvnpuvki"
+
+[functions.check-access]
+verify_jwt = false
+
+[functions.scrape-page]
+verify_jwt = false
+
+[functions.fetch-premium]
+verify_jwt = false
+
+[functions.admin-update-site]
+verify_jwt = false
