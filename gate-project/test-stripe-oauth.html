@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Stripe OAuth Diagnostic</title>
+  <style>
+    body { font-family: monospace; padding: 40px; max-width: 900px; margin: 0 auto; }
+    .section { background: #f5f5f5; padding: 20px; margin: 20px 0; border-radius: 8px; }
+    .code { background: white; padding: 10px; border-left: 4px solid #4CAF50; margin: 10px 0; }
+    .error { background: #ffebee; border-left-color: #f44336; }
+    .success { background: #e8f5e9; border-left-color: #4CAF50; }
+    button { background: #4CAF50; color: white; padding: 12px 24px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
+    button:hover { background: #45a049; }
+  </style>
+</head>
+<body>
+  <h1>🔍 Stripe OAuth Diagnostic Tool</h1>
+
+  <div class="section">
+    <h2>Step 1: Database Settings</h2>
+    <button onclick="checkSettings()">Check Database Settings</button>
+    <div id="settingsResult"></div>
+  </div>
+
+  <div class="section">
+    <h2>Step 2: OAuth URL</h2>
+    <div id="oauthUrl"></div>
+  </div>
+
+  <div class="section error">
+    <h2>Step 3: Add This to Stripe Dashboard</h2>
+    <p>Go to: <a href="https://dashboard.stripe.com/settings/connect" target="_blank">https://dashboard.stripe.com/settings/connect</a></p>
+    <p><strong>Under "Redirects" section, add:</strong></p>
+    <div class="code" id="redirectUri">Click "Check Database Settings" first</div>
+  </div>
+
+  <div class="section">
+    <h2>Step 4: Test OAuth</h2>
+    <button onclick="testOAuth()" id="testButton" disabled>Test Stripe Connect</button>
+  </div>
+
+  <script type="module">
+    import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+
+    const supabase = createClient(
+      'https://bakzzkadgmyvvvnpuvki.supabase.co',
+      'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJha3p6a2FkZ215dnZ2bnB1dmtpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjY0MTczMjksImV4cCI6MjA4MTk5MzMyOX0._tdT8u-ApjOACB1KVWg3honn-egJKfqTZWSKCW2goCk'
+    )
+
+    let clientId = ''
+    let redirectUri = ''
+
+    window.checkSettings = async function() {
+      const result = document.getElementById('settingsResult')
+      result.innerHTML = '<p>Loading...</p>'
+
+      try {
+        const { data, error } = await supabase
+          .from('app_settings')
+          .select('key, value')
+          .in('key', ['stripe_connect_client_id', 'app_url'])
+
+        if (error) throw error
+
+        const clientIdRow = data.find(r => r.key === 'stripe_connect_client_id')
+        const appUrlRow = data.find(r => r.key === 'app_url')
+
+        clientId = clientIdRow?.value?.trim() || ''
+        const appUrl = appUrlRow?.value || ''
+        redirectUri = `${appUrl}/stripe/connect/callback`
+
+        result.innerHTML = `
+          <div class="code success">
+            <strong>✓ Client ID:</strong> ${clientId}<br>
+            <strong>✓ App URL:</strong> ${appUrl}<br>
+            <strong>✓ Redirect URI:</strong> ${redirectUri}
+          </div>
+        `
+
+        // Show OAuth URL
+        const oauthUrl = `https://connect.stripe.com/oauth/authorize?` +
+          `response_type=code&` +
+          `client_id=${clientId}&` +
+          `scope=read_write&` +
+          `redirect_uri=${encodeURIComponent(redirectUri)}`
+
+        document.getElementById('oauthUrl').innerHTML = `
+          <div class="code">
+            <strong>Full OAuth URL:</strong><br>
+            <a href="${oauthUrl}" target="_blank">${oauthUrl}</a>
+          </div>
+        `
+
+        // Show redirect URI to add
+        document.getElementById('redirectUri').innerHTML = `<strong>${redirectUri}</strong>`
+
+        // Enable test button
+        document.getElementById('testButton').disabled = false
+
+      } catch (err) {
+        result.innerHTML = `<div class="code error">❌ Error: ${err.message}</div>`
+      }
+    }
+
+    window.testOAuth = function() {
+      if (!clientId || !redirectUri) {
+        alert('Please check database settings first')
+        return
+      }
+
+      const oauthUrl = `https://connect.stripe.com/oauth/authorize?` +
+        `response_type=code&` +
+        `client_id=${clientId}&` +
+        `scope=read_write&` +
+        `redirect_uri=${encodeURIComponent(redirectUri)}&` +
+        `state=test123`
+
+      console.log('Redirecting to:', oauthUrl)
+      window.location.href = oauthUrl
+    }
+  </script>
+</body>
+</html>
