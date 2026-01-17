@@ -1,0 +1,1 @@
+UPDATE user_profiles SET stripe_customer_id = 'cus_TleosoBpqgIcnQ' WHERE id = '528df0ea-6113-44e6-aeed-0ab1fc07ba5f';
