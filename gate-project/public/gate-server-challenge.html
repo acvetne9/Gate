@@ -1,0 +1,408 @@
+<!--
+  Gate Server-Side Gate Template v3.1
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  MAXIMUM PROTECTION: Blocks bots that don't execute JavaScript         │
+  │                                                                         │
+  │  Include this at the TOP of <head>, BEFORE any other scripts.          │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  Security Features:
+  ✓ Server-side default gate (blocks non-JS bots immediately)
+  ✓ Content blurring until verification passes
+  ✓ Fingerprint validation (detects spoofed requests)
+  ✓ Timing analysis (detects impossibly fast automation)
+  ✓ Proof-of-work challenges for suspicious traffic
+  ✓ Anti-replay tokens (single-use, 60-second expiry)
+
+  INSTALLATION (3 steps):
+  1. Copy this entire file content into your <head> section
+  2. Replace YOUR_API_KEY with your actual Gate API key
+  3. Add class="gate-content-protected" to elements you want to protect
+
+  EXAMPLE:
+  <html>
+    <head>
+      [paste this file content here]
+    </head>
+    <body>
+      <main class="gate-content-protected">
+        Your protected content...
+      </main>
+    </body>
+  </html>
+-->
+
+<!-- Gate Protection: Server-side gate styles -->
+<style id="gate-ssr-gate">
+  /* Default state: Show gate overlay */
+  .gate-gate-overlay {
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    background: rgba(0, 0, 0, 0.97) !important;
+    z-index: 2147483647 !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+  }
+
+  .gate-gate-modal {
+    background: white !important;
+    border: 3px solid black !important;
+    padding: 48px !important;
+    max-width: 520px !important;
+    width: 90% !important;
+    text-align: center !important;
+    box-shadow: 0 25px 50px rgba(0,0,0,0.5) !important;
+  }
+
+  .gate-gate-modal h2 {
+    font-size: 28px !important;
+    margin: 0 0 16px 0 !important;
+    font-weight: 800 !important;
+    color: #000 !important;
+  }
+
+  .gate-gate-modal p {
+    font-size: 16px !important;
+    color: #444 !important;
+    margin: 0 0 32px 0 !important;
+    line-height: 1.6 !important;
+  }
+
+  .gate-gate-btn {
+    display: inline-block !important;
+    background: black !important;
+    color: white !important;
+    border: none !important;
+    padding: 16px 48px !important;
+    font-size: 16px !important;
+    font-weight: 700 !important;
+    cursor: pointer !important;
+    transition: all 0.2s !important;
+    text-decoration: none !important;
+  }
+
+  .gate-gate-btn:hover {
+    background: #333 !important;
+    transform: translateY(-2px) !important;
+  }
+
+  .gate-gate-footer {
+    margin-top: 24px !important;
+    font-size: 12px !important;
+    color: #888 !important;
+  }
+
+  .gate-gate-footer a {
+    color: #888 !important;
+    text-decoration: underline !important;
+  }
+
+  /* Blur content behind gate */
+  .gate-content-protected {
+    filter: blur(10px) !important;
+    user-select: none !important;
+    pointer-events: none !important;
+  }
+
+  /* Hidden state when access is verified */
+  .gate-verified .gate-gate-overlay {
+    display: none !important;
+  }
+
+  .gate-verified .gate-content-protected {
+    filter: none !important;
+    user-select: auto !important;
+    pointer-events: auto !important;
+  }
+
+  /* Loading state */
+  .gate-verifying .gate-gate-modal h2::after {
+    content: '...';
+    animation: gate-dots 1.5s infinite;
+  }
+
+  @keyframes gate-dots {
+    0%, 20% { content: '.'; }
+    40% { content: '..'; }
+    60%, 100% { content: '...'; }
+  }
+</style>
+
+<!-- Gate Protection: Gate HTML (shown by default) -->
+<div class="gate-gate-overlay" id="gate-gate">
+  <div class="gate-gate-modal">
+    <h2 id="gate-gate-title">Verifying Access</h2>
+    <p id="gate-gate-message">Please wait while we verify your access...</p>
+    <a href="#" class="gate-gate-btn" id="gate-gate-btn" style="display: none;">
+      Subscribe for Access
+    </a>
+    <div id="gate-payment-url" style="display: none; background: #f5f5f5; border: 1px solid #ddd; padding: 10px 14px; margin-top: 16px; font-family: monospace; font-size: 12px; color: #333;">
+      <!-- Populated dynamically -->
+    </div>
+    <div class="gate-gate-footer">
+      Protected by <a href="https://security-gate.lovable.app" target="_blank">Gate</a>
+    </div>
+  </div>
+</div>
+
+<!-- NoScript fallback for bots that don't execute JS -->
+<noscript>
+  <style>
+    #gate-gate { display: flex !important; }
+    #gate-gate-btn { display: inline-block !important; }
+    #gate-payment-url { display: block !important; }
+  </style>
+  <div style="position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); background:white; border:3px solid black; padding:40px; max-width:500px; text-align:center; z-index:999999; font-family:system-ui,sans-serif;">
+    <h2 style="margin:0 0 16px; font-size:24px;">Automated Access Detected</h2>
+    <p style="color:#666; margin:0 0 24px; line-height:1.5;">
+      This content is protected. JavaScript is required for human access.
+      Automated bots must subscribe for access.
+    </p>
+    <a href="https://security-gate.lovable.app/bot-payment" style="display:inline-block; background:black; color:white; padding:14px 40px; text-decoration:none; font-weight:600;">
+      Subscribe for Access
+    </a>
+    <div style="margin-top:20px; font-size:13px; color:#666;">Or visit directly:</div>
+    <div style="background:#f5f5f5; border:1px solid #ddd; padding:10px; margin-top:8px; font-family:monospace; font-size:12px;">
+      https://security-gate.lovable.app/bot-payment
+    </div>
+  </div>
+</noscript>
+
+<!-- Gate Protection: Verification Script -->
+<script>
+(function() {
+  'use strict';
+
+  // Configuration - REPLACE WITH YOUR VALUES
+  var GATE_API_KEY = 'YOUR_API_KEY'; // Replace with your actual Gate API key
+  var GATE_API_URL = 'https://bakzzkadgmyvvvnpuvki.supabase.co/functions/v1/check-access';
+  var GATE_PAYMENT_URL = 'https://security-gate.lovable.app/bot-payment';
+
+  // Record page load time for timing analysis
+  var PAGE_LOAD_TIMESTAMP = Date.now();
+
+  // Get API key from script tag if available
+  var scripts = document.getElementsByTagName('script');
+  for (var i = 0; i < scripts.length; i++) {
+    var key = scripts[i].getAttribute('data-gate-api-key');
+    if (key) {
+      GATE_API_KEY = key;
+      break;
+    }
+  }
+
+  // Elements
+  var gate = document.getElementById('gate-gate');
+  var title = document.getElementById('gate-gate-title');
+  var message = document.getElementById('gate-gate-message');
+  var btn = document.getElementById('gate-gate-btn');
+
+  // Show verifying state
+  document.body.classList.add('gate-verifying');
+
+  // Quick bot checks before server verification
+  function quickBotCheck() {
+    var indicators = [];
+
+    // Check for automation
+    if (navigator.webdriver) indicators.push('webdriver');
+    if (window._phantom || window.phantom) indicators.push('phantom');
+    if (window.__nightmare) indicators.push('nightmare');
+    if (window._selenium) indicators.push('selenium');
+
+    // Check for missing features
+    if (!window.chrome && navigator.userAgent.indexOf('Chrome') > -1) {
+      indicators.push('fake_chrome');
+    }
+
+    return indicators;
+  }
+
+  // Generate fingerprint
+  function getFingerprint() {
+    try {
+      var canvas = document.createElement('canvas');
+      var ctx = canvas.getContext('2d');
+      ctx.textBaseline = 'top';
+      ctx.font = '14px Arial';
+      ctx.fillText('Gate', 2, 2);
+
+      return {
+        userAgent: navigator.userAgent,
+        language: navigator.language,
+        platform: navigator.platform,
+        screen: { w: screen.width, h: screen.height },
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        canvas: canvas.toDataURL().slice(-50),
+        plugins: navigator.plugins ? navigator.plugins.length : 0
+      };
+    } catch (e) {
+      return { error: true };
+    }
+  }
+
+  // Show blocked state
+  function showBlocked(reason) {
+    document.body.classList.remove('gate-verifying');
+    title.textContent = 'Access Blocked';
+    message.textContent = 'Automated access detected. Subscribe for full access.';
+    btn.style.display = 'inline-block';
+    // Show the payment URL box
+    var urlBox = document.getElementById('gate-payment-url');
+    if (urlBox) urlBox.style.display = 'block';
+    btn.href = GATE_PAYMENT_URL + '?reason=' + encodeURIComponent(reason) +
+               '&return=' + encodeURIComponent(window.location.href);
+  }
+
+  // Show allowed state
+  function showAllowed() {
+    document.body.classList.remove('gate-verifying');
+    document.body.classList.add('gate-verified');
+
+    // Remove protected class from content
+    var protected = document.querySelectorAll('.gate-content-protected');
+    for (var i = 0; i < protected.length; i++) {
+      protected[i].classList.remove('gate-content-protected');
+    }
+  }
+
+  // Solve proof-of-work challenge (async using Web Crypto)
+  function solveProofOfWork(challenge, difficulty, callback) {
+    var requiredPrefix = '';
+    for (var i = 0; i < difficulty; i++) requiredPrefix += '0';
+    var nonce = 0;
+
+    function tryNonce() {
+      var data = challenge + ':' + nonce;
+      var encoder = new TextEncoder();
+
+      crypto.subtle.digest('SHA-256', encoder.encode(data)).then(function(hashBuffer) {
+        var hashArray = new Uint8Array(hashBuffer);
+        var hashHex = '';
+        for (var j = 0; j < hashArray.length; j++) {
+          hashHex += hashArray[j].toString(16).padStart(2, '0');
+        }
+
+        if (hashHex.indexOf(requiredPrefix) === 0) {
+          callback({ challenge: challenge, nonce: nonce, hash: hashHex });
+        } else {
+          nonce++;
+          if (nonce > 10000000) {
+            console.error('[Gate] POW timeout');
+            showAllowed(); // Fail open
+            return;
+          }
+          // Yield to UI every 1000 iterations
+          if (nonce % 1000 === 0) {
+            setTimeout(tryNonce, 0);
+          } else {
+            tryNonce();
+          }
+        }
+      });
+    }
+
+    tryNonce();
+  }
+
+  // Verify access with server
+  function verifyAccess(powSolution) {
+    var botIndicators = quickBotCheck();
+
+    // If obvious bot, block immediately
+    if (botIndicators.length > 0) {
+      showBlocked(botIndicators.join(','));
+      return;
+    }
+
+    // Build request body
+    var requestBody = {
+      apiKey: GATE_API_KEY,
+      page: window.location.pathname,
+      userAgent: navigator.userAgent,
+      fingerprint: getFingerprint(),
+      referrer: document.referrer,
+      pageLoadTimestamp: PAGE_LOAD_TIMESTAMP
+    };
+
+    // Include POW solution if provided
+    if (powSolution) {
+      requestBody.powSolution = powSolution;
+    }
+
+    // Verify with server
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', GATE_API_URL, true);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+
+    xhr.onreadystatechange = function() {
+      if (xhr.readyState === 4) {
+        try {
+          var response = JSON.parse(xhr.responseText);
+
+          // Handle POW challenge
+          if (response.status === 'pow_required' && response.powChallenge) {
+            console.log('[Gate] Solving proof-of-work challenge...');
+            solveProofOfWork(response.powChallenge.challenge, response.powChallenge.difficulty, function(solution) {
+              console.log('[Gate] POW solved, retrying...');
+              verifyAccess(solution);
+            });
+            return;
+          }
+
+          if (response.allowed === true) {
+            showAllowed();
+          } else {
+            showBlocked(response.reason || 'verification_failed');
+          }
+        } catch (e) {
+          // On error, allow access (fail open for humans)
+          showAllowed();
+        }
+      }
+    };
+
+    xhr.onerror = function() {
+      // On network error, allow access
+      showAllowed();
+    };
+
+    xhr.send(JSON.stringify(requestBody));
+  }
+
+  // Start verification when DOM is ready
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', verifyAccess);
+  } else {
+    verifyAccess();
+  }
+})();
+</script>
+
+<!--
+  INTEGRATION INSTRUCTIONS:
+
+  1. Add class="gate-content-protected" to elements you want to protect
+     <main class="gate-content-protected">
+       Your content here...
+     </main>
+
+  2. Replace YOUR_API_KEY with your Gate API key, either:
+     - In the script above (var GATE_API_KEY = '...')
+     - Or add data-gate-api-key="YOUR_KEY" to any script tag
+
+  3. Include this file in the <head> of your pages:
+     <head>
+       ...
+       <?php include 'gate-server-gate.html'; ?>
+       ...
+     </head>
+
+  4. For dynamic sites (React, Vue, etc.), use gate-protection-v3.js instead
+-->

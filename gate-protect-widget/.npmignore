@@ -1,0 +1,6 @@
+src/
+.git
+.github
+node_modules/
+*.log
+.DS_Store

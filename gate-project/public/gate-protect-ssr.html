@@ -1,0 +1,61 @@
+<!--
+  Gate Protection - Server-Side (Maximum Protection)
+
+  USAGE: Paste this at the TOP of your <head> tag.
+  Add class="gate-protected" to content you want to protect.
+
+  - Non-JS bots: See blocked message, get redirected
+  - JS bots: Get redirected to payment
+  - Humans: Content revealed seamlessly
+-->
+<style id="gate-css">
+  .gate-protected { visibility: hidden !important; }
+  .gate-ok .gate-protected { visibility: visible !important; }
+</style>
+<noscript>
+  <meta http-equiv="refresh" content="0;url=/bot-payment?reason=no_javascript">
+</noscript>
+<script data-api-key="YOUR_API_KEY">
+(function() {
+  var GATE_API = 'https://bakzzkadgmyvvvnpuvki.supabase.co/functions/v1/check-access';
+  var PAYMENT = location.origin + '/bot-payment';
+  var LOAD = Date.now();
+  var key = document.currentScript.getAttribute('data-api-key');
+  if (!key || key === 'YOUR_API_KEY') { document.documentElement.classList.add('gate-ok'); return; }
+
+  if (navigator.webdriver || window._phantom || window.__nightmare) { location.replace(PAYMENT + '?reason=automation'); return; }
+
+  function fp() {
+    var f = { userAgent: navigator.userAgent, language: navigator.language, platform: navigator.platform,
+      screen: { width: screen.width, height: screen.height }, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      plugins: [].slice.call(navigator.plugins || []).map(function(p) { return p.name; }) };
+    try { var c = document.createElement('canvas'), x = c.getContext('2d'); x.font = '14px Arial'; x.fillText('G', 0, 10); f.canvas = c.toDataURL(); } catch (e) {}
+    try { var g = document.createElement('canvas').getContext('webgl'), d = g && g.getExtension('WEBGL_debug_renderer_info');
+      f.webgl = d ? { vendor: g.getParameter(d.UNMASKED_VENDOR_WEBGL), renderer: g.getParameter(d.UNMASKED_RENDERER_WEBGL) } : null; } catch (e) {}
+    return f;
+  }
+
+  function pow(ch, diff, cb) {
+    var pre = Array(diff + 1).join('0'), n = 0;
+    (function go() {
+      crypto.subtle.digest('SHA-256', new TextEncoder().encode(ch + ':' + n)).then(function(b) {
+        var h = [].map.call(new Uint8Array(b), function(x) { return x.toString(16).padStart(2, '0'); }).join('');
+        h.indexOf(pre) === 0 ? cb({ challenge: ch, nonce: n, hash: h }) : (++n % 1000 ? go() : setTimeout(go, 0));
+      });
+    })();
+  }
+
+  function check(sol) {
+    var body = { apiKey: key, page: location.pathname, userAgent: navigator.userAgent, fingerprint: fp(), pageLoadTimestamp: LOAD };
+    if (sol) body.powSolution = sol;
+    fetch(GATE_API, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then(function(r) { return r.json(); }).then(function(r) {
+        if (r.status === 'pow_required' && r.powChallenge) pow(r.powChallenge.challenge, r.powChallenge.difficulty, check);
+        else if (!r.allowed && r.status === 'payment_required') location.replace(PAYMENT + '?reason=' + encodeURIComponent(r.reason || 'bot') + '&return=' + encodeURIComponent(location.href));
+        else document.documentElement.classList.add('gate-ok');
+      }).catch(function() { document.documentElement.classList.add('gate-ok'); });
+  }
+
+  document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', function() { check(); }) : check();
+})();
+</script>

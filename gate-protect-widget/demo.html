@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GateProtect Demo - acvetne@gmail.com</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+      max-width: 800px;
+      margin: 50px auto;
+      padding: 20px;
+      line-height: 1.6;
+    }
+    .header {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 40px;
+      border-radius: 12px;
+      margin-bottom: 30px;
+      text-align: center;
+    }
+    .header h1 {
+      margin: 0 0 10px 0;
+    }
+    .header p {
+      margin: 0;
+      opacity: 0.9;
+    }
+    .content {
+      background: #f8f9fa;
+      padding: 30px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+    }
+    .config-box {
+      background: #fff;
+      border: 2px solid #e9ecef;
+      border-radius: 8px;
+      padding: 20px;
+      margin-top: 20px;
+    }
+    .config-box h3 {
+      margin-top: 0;
+      color: #667eea;
+    }
+    .config-box pre {
+      background: #f1f3f5;
+      padding: 15px;
+      border-radius: 6px;
+      overflow-x: auto;
+    }
+    .config-box code {
+      font-family: 'Monaco', 'Consolas', monospace;
+      font-size: 13px;
+    }
+    .status {
+      background: #d4edda;
+      color: #155724;
+      padding: 15px;
+      border-radius: 6px;
+      margin-bottom: 20px;
+      border: 1px solid #c3e6cb;
+    }
+    .debug-controls {
+      background: #fff3cd;
+      border: 1px solid #ffc107;
+      padding: 15px;
+      border-radius: 6px;
+      margin-top: 20px;
+    }
+    button {
+      background: #667eea;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 6px;
+      cursor: pointer;
+      margin: 5px;
+      font-size: 14px;
+    }
+    button:hover {
+      background: #5568d3;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>🛡️ GateProtect Demo</h1>
+    <p>Bot Protection Widget - Configured for acvetne@gmail.com</p>
+  </div>
+
+  <div class="status">
+    ✅ <strong>Protected Mode:</strong> Only bots are blocked. Humans are always allowed.
+  </div>
+
+  <div class="content">
+    <h2>Welcome to GateProtect!</h2>
+    <p>
+      This page demonstrates the GateProtect widget in action. The widget is configured to:
+    </p>
+    <ul>
+      <li><strong>Block bots</strong> like GPTBot, ClaudeBot, CCBot automatically</li>
+      <li><strong>Allow all humans</strong> - no gate for real users</li>
+      <li><strong>Allow SEO bots</strong> (Google, Bing, etc.) for search indexing</li>
+      <li><strong>Log all traffic</strong> for your dashboard analytics</li>
+    </ul>
+
+    <h3>How It Works:</h3>
+    <ol>
+      <li>Widget checks user agent and browser fingerprint</li>
+      <li>Identifies if visitor is a bot or human</li>
+      <li>Bots are silently blocked</li>
+      <li>Humans see your content without interruption</li>
+    </ol>
+
+    <p>
+      <strong>Try it yourself:</strong> Open this page with different user agents or use a bot
+      like curl to see the protection in action!
+    </p>
+  </div>
+
+  <div class="config-box">
+    <h3>📋 Your Widget Configuration</h3>
+    <p><strong>User:</strong> acvetne@gmail.com</p>
+    <p><strong>Mode:</strong> Bots Only (humans always allowed)</p>
+
+    <p>To use this widget on your own site, add this script tag to your HTML:</p>
+
+    <pre><code>&lt;script
+  src="https://bakzzkadgmyvvvnpuvki.supabase.co/storage/v1/object/public/public/widgets/gate-widget.min.js"
+  data-site-id="YOUR_SITE_ID"
+  data-api-key="sb_publishable_I13cTKcvZT6PkLrOVgQP-Q_-qoOhgKz"
+  data-api-url="https://bakzzkadgmyvvvnpuvki.supabase.co/functions/v1"
+  data-debug="true"
+  async
+&gt;&lt;/script&gt;</code></pre>
+
+    <p>
+      <strong>Get your credentials:</strong>
+      <a href="http://localhost:5173/dashboard" target="_blank">Go to Dashboard</a>
+      and create a site to get your Site ID and API Key.
+    </p>
+  </div>
+
+  <div class="debug-controls">
+    <h3>🔧 Debug Controls</h3>
+    <p>Use these controls to test the widget:</p>
+    <button onclick="window.GateProtect.debug.status()">View Status</button>
+    <button onclick="window.GateProtect.logs.download()">Download Logs</button>
+    <button onclick="window.GateProtect.showGatewall({ type: 'hard' })">Test Gate</button>
+    <button onclick="window.GateProtect.hideGatewall()">Hide Gate</button>
+    <button onclick="window.GateProtect.reload()">Reload Widget</button>
+  </div>
+
+  <script>
+    // Configuration Note:
+    // Replace these values with your actual credentials from the dashboard
+    // For now, this is a demo showing how the widget would be integrated
+
+    console.log('%c🛡️ GateProtect Demo Loaded', 'color: #667eea; font-size: 16px; font-weight: bold');
+    console.log('This demo shows the widget integration.');
+    console.log('To get real bot protection, create a site in your dashboard!');
+
+    // Note: The actual widget script with data attributes would go here
+    // For demo purposes, we're showing the integration pattern
+  </script>
+
+  <!--
+    ⚠️ IMPORTANT: Widget script for staging (uses uploaded Supabase URL)
+
+    <script
+      src="https://bakzzkadgmyvvvnpuvki.supabase.co/storage/v1/object/public/public/widgets/gate-widget.min.js"
+      data-site-id="YOUR_SITE_ID"
+      data-api-key="sb_publishable_I13cTKcvZT6PkLrOVgQP-Q_-qoOhgKz"
+      data-api-url="https://bakzzkadgmyvvvnpuvki.supabase.co/functions/v1"
+      data-debug="true"
+      async
+    ></script>
+  -->
+
+</body>
+</html>
