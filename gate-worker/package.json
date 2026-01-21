@@ -1,0 +1,19 @@
+{
+  "name": "gate-protect-worker",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker for bot detection and gate enforcement",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.15.0",
+    "vitest": "^4.1.5",
+    "wrangler": "^4.60.0"
+  }
+}

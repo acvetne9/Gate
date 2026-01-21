@@ -1,0 +1,61 @@
+# ============================================
+# Gate Protection Worker v3.0
+# ============================================
+# Deploy with: npx wrangler deploy
+# Local dev:   npx wrangler dev
+# ============================================
+
+name = "gate-protect-worker"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# ============================================
+# Environment Variables (Secrets)
+# ============================================
+# Set these using: npx wrangler secret put <NAME>
+#
+# Required:
+#   CHALLENGE_SECRET      - HMAC secret for signing challenge cookies (32+ random chars)
+#   TOKEN_SECRET          - HMAC secret for paid access tokens (32+ random chars)
+#   ORIGIN_HOST           - Your origin server hostname (e.g. origin.example.com)
+#   ORIGIN_SECRET         - Secret header value to verify requests at origin
+#   STRIPE_API_KEY        - Stripe secret key (sk_live_xxx or sk_test_xxx)
+#   STRIPE_WEBHOOK_SECRET - Stripe webhook signing secret (whsec_xxx)
+#
+# Optional:
+#   GATE_PAYMENT_URL           - Bot payment page URL (default: https://securitygate.app/bot-payment)
+
+# ============================================
+# KV Namespaces
+# ============================================
+# Create with: npx wrangler kv namespace create RATE_LIMIT
+# Create with: npx wrangler kv namespace create ATTEMPTS
+
+[[kv_namespaces]]
+binding = "RATE_LIMIT"
+id = "7eebf996ad4d4666b4f2fe1b6af5f397"
+
+[[kv_namespaces]]
+binding = "ATTEMPTS"
+id = "92855953bd0f4b3e8818b2a378861e89"
+
+# ============================================
+# Durable Objects
+# ============================================
+
+[durable_objects]
+bindings = [
+  { name = "TOKEN_DO", class_name = "TokenDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TokenDO"]
+
+# ============================================
+# Routes
+# ============================================
+# Point your domain's DNS to Cloudflare, then uncomment:
+# routes = [
+#   { pattern = "example.com/*", zone_name = "example.com" }
+# ]
