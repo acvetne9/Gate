@@ -1,5 +1,5 @@
 /**
- * Gate Protection Worker v3.0
+ * Gate Protection Worker v4.0
  * ===========================
  * Production reverse proxy for bot access control.
  *
@@ -15,6 +15,15 @@
  *   6. If bot detected → redirect to payment page
  *   7. If paid token present → verify signature + subscription → forward
  *
+ * KV Optimization Strategy:
+ *   L1: In-memory Map (per-isolate, ~0ms, free)
+ *   L2: Cache API (per-colo, ~1ms, free)
+ *   L3: KV (global, ~50ms, metered)
+ *
+ *   Verified humans skip all KV operations entirely.
+ *   Stats are batched in memory and flushed periodically.
+ *   Rate limits and bot cache use L1→L2→L3 tiered lookups.
+ *
  * Env vars required:
  *   CHALLENGE_SECRET  - HMAC key for signing challenge cookies
  *   TOKEN_SECRET      - HMAC key for paid access tokens
@@ -25,23 +34,140 @@
  *   GATE_PAYMENT_URL       - Bot payment page URL (default: https://securitygate.app/bot-payment)
  *
  * KV Namespaces:
- *   RATE_LIMIT        - Rate limiting counters
+ *   RATE_LIMIT        - Rate limiting, bot cache, and stats
  *   ATTEMPTS          - Token storage for paid bots
  *
  * Durable Objects:
  *   TOKEN_DO          - Atomic token consumption
  */
 
+/* ============================================================
+   L1 IN-MEMORY CACHE
+   Survives across requests within the same isolate (~5-30 min).
+   Eliminates KV reads for hot keys. Bounded to prevent leaks.
+============================================================ */
+const MEM_MAX_ENTRIES = 2048;
+const mem = new Map();
+
+function memGet(key) {
+  const entry = mem.get(key);
+  if (!entry) return undefined;
+  if (Date.now() > entry.exp) {
+    mem.delete(key);
+    return undefined;
+  }
+  return entry.val;
+}
+
+function memSet(key, val, ttlMs) {
+  if (mem.size >= MEM_MAX_ENTRIES) {
+    // Evict oldest quarter when full
+    const keys = mem.keys();
+    for (let i = 0; i < MEM_MAX_ENTRIES / 4; i++) {
+      const k = keys.next().value;
+      if (k) mem.delete(k);
+    }
+  }
+  mem.set(key, { val, exp: Date.now() + ttlMs });
+}
+
+/* ============================================================
+   L2 CACHE API HELPERS
+   Free per-colo cache. Survives isolate recycling.
+   We store bot lookups as synthetic Response objects.
+============================================================ */
+const CACHE_PREFIX = "https://gate-internal.cache/";
+
+async function cacheGet(key) {
+  try {
+    const cache = caches.default;
+    const res = await cache.match(new Request(CACHE_PREFIX + key));
+    if (!res) return undefined;
+    return await res.json();
+  } catch {
+    return undefined;
+  }
+}
+
+async function cachePut(key, val, ttlSeconds) {
+  try {
+    const cache = caches.default;
+    const res = new Response(JSON.stringify(val), {
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": `s-maxage=${ttlSeconds}`,
+      },
+    });
+    await cache.put(new Request(CACHE_PREFIX + key), res);
+  } catch {}
+}
+
+/* ============================================================
+   BATCHED STATS
+   Accumulates counts in memory and flushes to KV periodically.
+   One KV read+write per flush instead of per request.
+============================================================ */
+const STATS_FLUSH_INTERVAL = 50; // flush every N increments
+const statsBuf = {};
+let statsCounter = 0;
+
+function bufferStat(category) {
+  statsBuf[category] = (statsBuf[category] || 0) + 1;
+  statsBuf._total = (statsBuf._total || 0) + 1;
+  statsCounter++;
+}
+
+async function flushStatsIfNeeded(env) {
+  if (statsCounter < STATS_FLUSH_INTERVAL) return;
+  if (!env.RATE_LIMIT) return;
+  const snapshot = { ...statsBuf };
+  const count = statsCounter;
+  // Reset buffer before async write to avoid double-counting
+  for (const k of Object.keys(statsBuf)) statsBuf[k] = 0;
+  statsCounter = 0;
+
+  try {
+    const stored = await env.RATE_LIMIT.get("stats:totals", { type: "json" }) || {};
+    for (const [k, v] of Object.entries(snapshot)) {
+      if (v > 0) stored[k] = (stored[k] || 0) + v;
+    }
+    await env.RATE_LIMIT.put("stats:totals", JSON.stringify(stored));
+  } catch {
+    // Restore on failure so counts aren't lost
+    for (const [k, v] of Object.entries(snapshot)) {
+      statsBuf[k] = (statsBuf[k] || 0) + v;
+    }
+    statsCounter += count;
+  }
+}
+
+async function forceFlushStats(env) {
+  if (statsCounter === 0 || !env.RATE_LIMIT) return;
+  const snapshot = { ...statsBuf };
+  for (const k of Object.keys(statsBuf)) statsBuf[k] = 0;
+  statsCounter = 0;
+  try {
+    const stored = await env.RATE_LIMIT.get("stats:totals", { type: "json" }) || {};
+    for (const [k, v] of Object.entries(snapshot)) {
+      if (v > 0) stored[k] = (stored[k] || 0) + v;
+    }
+    await env.RATE_LIMIT.put("stats:totals", JSON.stringify(stored));
+  } catch {}
+}
+
+/* ============================================================
+   MAIN HANDLER
+============================================================ */
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Static assets pass through without challenge (images, CSS, JS, fonts)
+    // Static assets pass through without challenge
     if (isStaticAsset(url.pathname)) {
       return forwardToOrigin(request, env);
     }
 
-    // Bot payment page must be accessible to bots (they're redirected here to pay)
+    // Bot payment page must be accessible to bots
     if (url.pathname.startsWith("/bot-payment")) {
       return forwardToOrigin(request, env);
     }
@@ -57,37 +183,40 @@ export default {
         return handleChallengeResponse(request, env);
       }
 
-      // Stats API endpoint — returns request counts from KV
+      // Stats API endpoint — flush buffer first for accuracy
       if (url.pathname === "/__gate-stats") {
         if (request.method === "OPTIONS") {
           return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, OPTIONS", "Access-Control-Allow-Headers": "*", "Access-Control-Max-Age": "86400" } });
         }
+        await forceFlushStats(env);
         return handleStatsRequest(env);
       }
 
-      // Rate limiting (KV-backed, persists across isolates)
       const ip = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown";
+
+      // Check for valid signed challenge cookie (humans who already passed).
+      // Verified humans skip ALL KV operations — no rate limit check, no bot
+      // cache lookup, no stats write. The signed cookie is self-contained proof.
+      const cookieValid = await verifyChallengeCookie(request, env, ip);
+      if (cookieValid) {
+        bufferStat('humans_allowed');
+        ctx.waitUntil(flushStatsIfNeeded(env));
+
+        if (url.searchParams.has("__gate_content_token")) {
+          return handleContentTokenRequest(request, url, env);
+        }
+        return forwardWithContentProtection(request, env, url);
+      }
+
+      // Rate limiting — L1 first, KV fallback
       const rateLimited = await checkRateLimit(ip, env);
       if (rateLimited) {
-        ctx.waitUntil(incrementStats(env, 'rate_limited'));
+        bufferStat('rate_limited');
+        ctx.waitUntil(flushStatsIfNeeded(env));
         return new Response("Too Many Requests", {
           status: 429,
           headers: { "Retry-After": "60", "Content-Type": "text/plain" }
         });
-      }
-
-      // Check for valid signed challenge cookie (humans who already passed)
-      const cookieValid = await verifyChallengeCookie(request, env);
-      if (cookieValid) {
-        ctx.waitUntil(incrementStats(env, 'humans_allowed'));
-
-        // Per-page content token: if request has __gate_content_token, serve raw content
-        // Otherwise, serve page with content stripped and a loader script injected
-        if (url.searchParams.has("__gate_content_token")) {
-          return handleContentTokenRequest(request, url, env);
-        }
-
-        return forwardWithContentProtection(request, env, url);
       }
 
       // Check for paid bot token
@@ -97,46 +226,95 @@ export default {
         if (tokenResult) return tokenResult;
       }
 
+      // Known-bot cache: L1 → L2 → L3
+      const ua = request.headers.get("user-agent") || "";
+      const botKey = `bot:${await sha256Short(ip + "|" + ua)}`;
+      const knownBot = await tieredBotLookup(botKey, env);
+      if (knownBot) {
+        bufferStat('bots_blocked');
+        ctx.waitUntil(Promise.all([
+          logRequest(ip, request, knownBot, "blocked_cached", env),
+          flushStatsIfNeeded(env),
+        ]));
+        return redirectToPayment(url, "known_bot", knownBot);
+      }
+
       // Run bot detection
       const detection = detectBot(request);
 
-      // Definite bot → redirect to payment (no challenge, just block)
+      // Definite bot → cache across all tiers, redirect to payment
       if (detection.isBot && detection.confidence >= 80) {
-        ctx.waitUntil(Promise.all([logRequest(ip, request, detection, "blocked", env), incrementStats(env, 'bots_blocked')]));
+        const cacheEntry = {
+          isBot: true,
+          confidence: detection.confidence,
+          signals: detection.signals,
+          cachedAt: Date.now(),
+        };
+        bufferStat('bots_blocked');
+        ctx.waitUntil(Promise.all([
+          tieredBotStore(botKey, cacheEntry, env),
+          logRequest(ip, request, detection, "blocked", env),
+          flushStatsIfNeeded(env),
+        ]));
         return redirectToPayment(url, "bot_detected", detection);
       }
 
-      // Everyone else must solve a PoW challenge to prove they're a real browser.
-      // Difficulty scales with suspicion: higher score = harder challenge.
+      // Everyone else must solve a PoW challenge
       const difficulty = detection.confidence >= 50 ? 6 : 4;
-      const statCategory = detection.confidence >= 50 ? 'bots_challenged' : 'humans_challenged';
-      ctx.waitUntil(incrementStats(env, statCategory));
+      bufferStat(detection.confidence >= 50 ? 'bots_challenged' : 'humans_challenged');
+      ctx.waitUntil(flushStatsIfNeeded(env));
       return serveChallengePage(request, env, { difficulty, returnTo: url.toString() });
 
     } catch (err) {
       console.error("Worker error:", err);
-      // Fail open — forward to origin rather than blocking
       return forwardToOrigin(request, env);
     }
   }
 };
 
 /* ============================================================
-   REQUEST STATS (KV-backed counters)
-   Tracks total requests, bots blocked, humans allowed, etc.
+   TIERED BOT CACHE (L1 → L2 → L3)
+   Reads cascade down; writes populate all tiers.
 ============================================================ */
-async function incrementStats(env, category) {
-  if (!env.RATE_LIMIT) return;
+async function tieredBotLookup(key, env) {
+  // L1: in-memory
+  const l1 = memGet(key);
+  if (l1) return l1;
+
+  // L2: Cache API (free)
+  const l2 = await cacheGet(key);
+  if (l2) {
+    memSet(key, l2, 600_000); // backfill L1 for 10 min
+    return l2;
+  }
+
+  // L3: KV (metered)
+  if (!env.RATE_LIMIT) return null;
   try {
-    // Update running totals (single KV key, never expires)
-    const totalsRaw = await env.RATE_LIMIT.get("stats:totals", { type: "json" });
-    const totals = totalsRaw || {};
-    totals[category] = (totals[category] || 0) + 1;
-    totals._total = (totals._total || 0) + 1;
-    await env.RATE_LIMIT.put("stats:totals", JSON.stringify(totals));
-  } catch {}
+    const l3 = await env.RATE_LIMIT.get(key, { type: "json" });
+    if (l3) {
+      memSet(key, l3, 600_000);
+      // backfill L2 async (don't block response)
+      cachePut(key, l3, 3600).catch(() => {});
+    }
+    return l3 || null;
+  } catch {
+    return null;
+  }
 }
 
+async function tieredBotStore(key, entry, env) {
+  // Write to all tiers in parallel
+  memSet(key, entry, 600_000); // L1: 10 min
+  await Promise.all([
+    cachePut(key, entry, 86400),                                                    // L2: 24h
+    env.RATE_LIMIT ? env.RATE_LIMIT.put(key, JSON.stringify(entry), { expirationTtl: 86400 }) : Promise.resolve(), // L3: 24h
+  ]).catch(() => {});
+}
+
+/* ============================================================
+   STATS REQUEST HANDLER
+============================================================ */
 async function handleStatsRequest(env) {
   const headers = {
     "Access-Control-Allow-Origin": "*",
@@ -151,10 +329,8 @@ async function handleStatsRequest(env) {
   }
 
   try {
-    // Single KV read — fast
     const totals = await env.RATE_LIMIT.get("stats:totals", { type: "json" }) || {};
     const totalRequests = totals._total || 0;
-
     return new Response(JSON.stringify({ totalRequests, totals }), { headers });
   } catch (e) {
     return new Response(JSON.stringify({ totalRequests: 0, totals: {}, error: e.message }), { status: 500, headers });
@@ -163,7 +339,6 @@ async function handleStatsRequest(env) {
 
 /* ============================================================
    STATIC ASSET DETECTION
-   Let images/CSS/JS/fonts pass without challenge
 ============================================================ */
 function isStaticAsset(pathname) {
   const staticExts = /\.(css|js|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot|otf|webp|avif|mp4|webm|pdf|map|txt|xml|json)$/i;
@@ -277,14 +452,11 @@ function detectBot(request) {
 }
 
 /* ============================================================
-   CHALLENGE COOKIE - SIGNED HMAC (replaces trivial cf_clearance)
+   CHALLENGE COOKIE - SIGNED HMAC
+   Verified humans get a self-contained signed cookie.
+   Page rate limiting uses L1 memory instead of KV.
 ============================================================ */
-/**
- * Verify challenge cookie AND check page rate limit.
- * Returns false if cookie is invalid OR the visitor has accessed too many pages.
- * A human reads ~5-10 pages per session. A scraper reads thousands.
- */
-async function verifyChallengeCookie(request, env) {
+async function verifyChallengeCookie(request, env, ip) {
   const cookies = parseCookies(request.headers.get("cookie") || "");
   const token = cookies["__gate_verified"];
   if (!token) return false;
@@ -298,14 +470,13 @@ async function verifyChallengeCookie(request, env) {
     const expectedSig = await hmacSHA256(`${payloadB64}.${expB64}`, env.CHALLENGE_SECRET);
     if (!timingSafeEqual(sig, expectedSig)) return false;
 
-    // Check expiration (10 minute TTL)
+    // Check expiration
     const exp = parseInt(atob(expB64), 10);
     if (Date.now() > exp) return false;
 
     const payload = JSON.parse(atob(payloadB64));
 
     // Verify IP binding
-    const ip = request.headers.get("cf-connecting-ip") || "";
     const currentIpHash = await sha256Short(ip);
     if (payload.ip !== currentIpHash) return false;
 
@@ -313,22 +484,12 @@ async function verifyChallengeCookie(request, env) {
     const currentUaHash = await sha256Short(request.headers.get("user-agent") || "");
     if (payload.ua !== currentUaHash) return false;
 
-    // Page rate limit: max 30 unique pages per 10-minute window
-    // A human browsing normally hits 5-10 pages. A scraper hits hundreds.
-    if (env.RATE_LIMIT) {
-      const pageKey = `pages:${currentIpHash}`;
-      try {
-        const stored = await env.RATE_LIMIT.get(pageKey, { type: "json" });
-        const pageCount = (stored || 0) + 1;
-
-        if (pageCount > 30) {
-          // Too many pages — force re-verification
-          return false;
-        }
-
-        await env.RATE_LIMIT.put(pageKey, JSON.stringify(pageCount), { expirationTtl: 600 });
-      } catch {}
-    }
+    // Page rate limit via L1 memory — no KV needed.
+    // Humans browse 5-10 pages per session. Scrapers hit hundreds.
+    const pageKey = `pages:${currentIpHash}`;
+    const pageCount = (memGet(pageKey) || 0) + 1;
+    if (pageCount > 30) return false;
+    memSet(pageKey, pageCount, 600_000); // 10 min window
 
     return true;
   } catch {
@@ -340,7 +501,7 @@ async function createChallengeCookie(request, env) {
   const ip = request.headers.get("cf-connecting-ip") || "";
   const ipHash = await sha256Short(ip);
   const uaHash = await sha256Short(request.headers.get("user-agent") || "");
-  const ttl = 86400 * 1000; // 24 hours — once human, always human
+  const ttl = 86400 * 1000; // 24 hours
 
   const payload = { ip: ipHash, ua: uaHash };
   const payloadB64 = btoa(JSON.stringify(payload));
@@ -353,11 +514,6 @@ async function createChallengeCookie(request, env) {
 
 /* ============================================================
    CHALLENGE PAGE
-   Serves an HTML page with inline JS that:
-   1. Solves a Proof-of-Work (SHA-256 with leading zeros)
-   2. Collects browser fingerprint
-   3. Posts solution to /__gate-verify
-   4. On success, receives signed cookie and redirects back
 ============================================================ */
 function serveChallengePage(request, env, { difficulty = 4, returnTo = "/" }) {
   const challenge = crypto.randomUUID();
@@ -398,8 +554,6 @@ function serveChallengePage(request, env, { difficulty = 4, returnTo = "/" }) {
       var turnstileSiteKey = "${turnstileSiteKey}";
       var startTime = Date.now();
 
-      // ========== BEHAVIORAL TRACKING ==========
-      // Bots don't move mice, scroll, or interact. Humans do — even on a loading page.
       var behavior = { mouse: 0, scroll: 0, touch: 0, keys: 0, clicks: 0, moveX: [], moveY: [], timing: [] };
       var lastMove = 0;
 
@@ -419,7 +573,6 @@ function serveChallengePage(request, env, { difficulty = 4, returnTo = "/" }) {
       document.addEventListener("click", function() { behavior.clicks++; });
 
       function getBehaviorSummary() {
-        // Compute movement variance (bots have zero or perfectly linear movement)
         var xVar = variance(behavior.moveX);
         var yVar = variance(behavior.moveY);
         var timingVar = variance(behavior.timing.slice(-10));
@@ -443,7 +596,6 @@ function serveChallengePage(request, env, { difficulty = 4, returnTo = "/" }) {
         return arr.reduce(function(s,v){return s + (v-mean)*(v-mean)},0) / arr.length;
       }
 
-      // ========== FINGERPRINT COLLECTION ==========
       function getFingerprint() {
         var canvas = document.createElement("canvas");
         var ctx = canvas.getContext("2d");
@@ -475,7 +627,6 @@ function serveChallengePage(request, env, { difficulty = 4, returnTo = "/" }) {
         };
       }
 
-      // ========== POW SOLVER ==========
       async function solvePoW(ch, diff) {
         var prefix = "0".repeat(diff);
         var nonce = 0;
@@ -489,7 +640,6 @@ function serveChallengePage(request, env, { difficulty = 4, returnTo = "/" }) {
         }
       }
 
-      // ========== TURNSTILE ==========
       function getTurnstileToken() {
         if (!turnstileSiteKey || typeof turnstile === "undefined") return Promise.resolve(null);
         return new Promise(function(resolve) {
@@ -502,7 +652,6 @@ function serveChallengePage(request, env, { difficulty = 4, returnTo = "/" }) {
         });
       }
 
-      // ========== MAIN FLOW ==========
       try {
         var fingerprint = getFingerprint();
 
@@ -516,7 +665,6 @@ function serveChallengePage(request, env, { difficulty = 4, returnTo = "/" }) {
         document.getElementById("status").textContent = "Solving challenge...";
         var pow = await solvePoW(challenge, difficulty);
 
-        // Wait for Turnstile (if enabled)
         var turnstileToken = null;
         if (turnstileSiteKey) {
           document.getElementById("status").textContent = "Final verification...";
@@ -569,7 +717,9 @@ function serveChallengePage(request, env, { difficulty = 4, returnTo = "/" }) {
 
 /* ============================================================
    CHALLENGE VERIFICATION ENDPOINT
-   Validates PoW solution + fingerprint, issues signed cookie
+   Validates PoW solution + fingerprint, issues signed cookie.
+   Challenge replay uses L1 memory (free) with KV as fallback
+   for cross-isolate protection.
 ============================================================ */
 async function handleChallengeResponse(request, env) {
   try {
@@ -580,7 +730,6 @@ async function handleChallengeResponse(request, env) {
       return new Response("Invalid request", { status: 400 });
     }
 
-    // All verification failures redirect to payment page
     const payUrl = returnTo || request.headers.get("referer") || "/";
     const paymentRedirectUrl = `${new URL(request.url).origin}/bot-payment?return=${encodeURIComponent(payUrl)}&reason=verification_failed`;
 
@@ -595,15 +744,10 @@ async function handleChallengeResponse(request, env) {
     }
 
     // ---- FINGERPRINT VALIDATION ----
-    // Each check catches a different class of automation tool.
-    // Stealth plugins can spoof some of these, but spoofing ALL consistently is hard.
-
-    // 1. Webdriver flag (Selenium, basic Puppeteer)
     if (fingerprint.webdriver) {
       return Response.redirect(paymentRedirectUrl, 302);
     }
 
-    // 2. Headless WebGL renderers (SwiftShader = Chrome headless default)
     if (fingerprint.webgl) {
       const renderer = (fingerprint.webgl.r || "").toLowerCase();
       if (/swiftshader|llvmpipe|software|mesa offscreen|virtualbox|vmware/i.test(renderer)) {
@@ -611,32 +755,26 @@ async function handleChallengeResponse(request, env) {
       }
     }
 
-    // 3. Missing canvas fingerprint (headless often fails to render)
     if (!fingerprint.canvas || fingerprint.canvas.length < 20) {
       return Response.redirect(paymentRedirectUrl, 302);
     }
 
-    // 4. Zero screen dimensions (headless default)
     if (fingerprint.sw === 0 || fingerprint.sh === 0) {
       return Response.redirect(paymentRedirectUrl, 302);
     }
 
-    // 5. Missing WebGL entirely (real browsers always have it)
     if (!fingerprint.webgl) {
       return Response.redirect(paymentRedirectUrl, 302);
     }
 
-    // 6. No language set (real browsers always report a language)
     if (!fingerprint.lang) {
       return Response.redirect(paymentRedirectUrl, 302);
     }
 
-    // 7. Zero hardware concurrency (real devices have at least 1 core)
     if (fingerprint.cores === 0) {
       return Response.redirect(paymentRedirectUrl, 302);
     }
 
-    // 8. No plugins AND no touch AND headless screen size (800x600, 1024x768)
     const suspiciousScreen = (fingerprint.sw === 800 && fingerprint.sh === 600) ||
                               (fingerprint.sw === 1024 && fingerprint.sh === 768);
     const noPlugins = !fingerprint.plugins || fingerprint.plugins.length === 0;
@@ -644,9 +782,14 @@ async function handleChallengeResponse(request, env) {
       return Response.redirect(paymentRedirectUrl, 302);
     }
 
-    // 9. Challenge replay protection — each challenge UUID can only be used once
+    // Challenge replay protection: L1 first, KV as cross-isolate fallback
+    const challengeKey = `challenge:${challenge}`;
+    if (memGet(challengeKey)) {
+      return Response.redirect(paymentRedirectUrl, 302);
+    }
+    memSet(challengeKey, 1, 600_000); // 10 min
+
     if (env.RATE_LIMIT) {
-      const challengeKey = `challenge:${challenge}`;
       const used = await env.RATE_LIMIT.get(challengeKey);
       if (used) {
         return Response.redirect(paymentRedirectUrl, 302);
@@ -655,19 +798,13 @@ async function handleChallengeResponse(request, env) {
     }
 
     // ---- BEHAVIORAL VALIDATION ----
-    // Bots solve PoW and submit with zero interaction.
-    // Real humans at least wait while watching the spinner.
-    // Failures redirect to payment page — if you fail the challenge, you pay.
     if (behavior) {
-      // Check mouse movement variance — bots have perfectly linear or zero movement
       if (behavior.mouse > 5 && behavior.moveVarianceX === 0 && behavior.moveVarianceY === 0) {
         return Response.redirect(paymentRedirectUrl, 302);
       }
     }
-    // Missing behavioral data is OK — mobile users and fast connections may not generate much
 
     // ---- TURNSTILE VALIDATION ----
-    // If Turnstile is configured, verify the token with Cloudflare
     if (env.TURNSTILE_SECRET_KEY) {
       if (!turnstileToken) {
         return Response.redirect(paymentRedirectUrl, 302);
@@ -703,7 +840,6 @@ async function handleChallengeResponse(request, env) {
 
 /* ============================================================
    PAID ACCESS VERIFICATION
-   For bots that have purchased access via Stripe
 ============================================================ */
 async function handlePaidAccess(token, request, env, ctx) {
   const verified = await verifyTokenSignature(token, env.TOKEN_SECRET);
@@ -713,18 +849,15 @@ async function handlePaidAccess(token, request, env, ctx) {
 
   const payload = verified.payload;
 
-  // Check expiration
   if (Date.now() > payload.exp) {
     return redirectToPayment(new URL(request.url), "token_expired", {});
   }
 
-  // Verify subscription is active
   const subscriptionActive = await verifyStripeSubscription(payload.customerId, env);
   if (!subscriptionActive) {
     return redirectToPayment(new URL(request.url), "inactive_subscription", {});
   }
 
-  // If using Durable Objects for atomic token consumption
   if (payload.do_id && env.TOKEN_DO) {
     const binding = await extractBinding(request);
     const id = env.TOKEN_DO.idFromString(payload.do_id);
@@ -746,37 +879,58 @@ async function handlePaidAccess(token, request, env, ctx) {
     }
   }
 
-  // Track usage asynchronously
   ctx.waitUntil(trackUsage(payload.customerId, env));
 
-  // Forward to origin
   return forwardToOrigin(request, env);
 }
 
 /* ============================================================
-   RATE LIMITING (KV-backed, persists across worker isolates)
+   RATE LIMITING
+   L1 memory handles the fast path. KV is only read on L1
+   cache miss and only written when the count actually changes
+   state (first request in window, or crossing the threshold).
 ============================================================ */
 async function checkRateLimit(ip, env) {
-  if (!env.RATE_LIMIT) return false; // Skip if KV not configured
-
   const key = `rl:${ip}`;
   const now = Math.floor(Date.now() / 1000);
-  const windowSize = 60; // 1 minute window
-  const maxRequests = 60; // 60 requests per minute
+  const windowSize = 60;
+  const maxRequests = 60;
 
+  // L1 check
+  const cached = memGet(key);
+  if (cached) {
+    if (now - cached.ts > windowSize) {
+      memSet(key, { count: 1, ts: now }, windowSize * 2 * 1000);
+      return false;
+    }
+    if (cached.count >= maxRequests) return true;
+    cached.count++;
+    memSet(key, cached, windowSize * 2 * 1000);
+    return false;
+  }
+
+  // L1 miss → check KV
+  if (!env.RATE_LIMIT) return false;
   try {
     const stored = await env.RATE_LIMIT.get(key, { type: "json" });
     if (!stored || now - stored.ts > windowSize) {
-      await env.RATE_LIMIT.put(key, JSON.stringify({ count: 1, ts: now }), { expirationTtl: windowSize * 2 });
+      const entry = { count: 1, ts: now };
+      memSet(key, entry, windowSize * 2 * 1000);
+      await env.RATE_LIMIT.put(key, JSON.stringify(entry), { expirationTtl: windowSize * 2 });
       return false;
     }
 
-    if (stored.count >= maxRequests) return true;
+    if (stored.count >= maxRequests) {
+      memSet(key, stored, windowSize * 2 * 1000);
+      return true;
+    }
 
-    await env.RATE_LIMIT.put(key, JSON.stringify({ count: stored.count + 1, ts: stored.ts }), { expirationTtl: windowSize * 2 });
+    stored.count++;
+    memSet(key, stored, windowSize * 2 * 1000);
+    await env.RATE_LIMIT.put(key, JSON.stringify(stored), { expirationTtl: windowSize * 2 });
     return false;
   } catch {
-    return false; // Fail open on KV errors
+    return false;
   }
 }
 
@@ -784,7 +938,7 @@ async function checkRateLimit(ip, env) {
    REQUEST LOGGING (async, non-blocking)
 ============================================================ */
 async function logRequest(ip, request, detection, status, env) {
-  if (!env.RATE_LIMIT) return; // Use same KV for logging
+  if (!env.RATE_LIMIT) return;
   const key = `log:${ip}:${Date.now()}`;
   const entry = {
     ip,
@@ -911,10 +1065,8 @@ async function handleStripeWebhook(request, env, ctx) {
   const session = event.data.object;
   const meta = session.metadata || {};
 
-  // Token expiration: 5 min
   const exp = Date.now() + 5 * 60 * 1000;
 
-  // Durable Object token creation
   if (env.TOKEN_DO && meta.binding) {
     const id = env.TOKEN_DO.newUniqueId();
     const stub = env.TOKEN_DO.get(id);
@@ -978,15 +1130,10 @@ async function forwardToOrigin(request, env) {
 
 /* ============================================================
    PER-PAGE CONTENT PROTECTION
-   Even after challenge verification, content is not in the initial HTML.
-   The Worker fetches the origin page, strips the <main>/<article> content,
-   replaces it with a loader that fetches content via a signed token.
-   This means even if a cookie is stolen, view-source shows no content.
 ============================================================ */
 async function forwardWithContentProtection(request, env, url) {
   const originResponse = await forwardToOrigin(request, env);
 
-  // Only protect HTML pages (not API calls, JSON, etc.)
   const contentType = originResponse.headers.get("content-type") || "";
   if (!contentType.includes("text/html")) {
     return originResponse;
@@ -994,22 +1141,19 @@ async function forwardWithContentProtection(request, env, url) {
 
   const html = await originResponse.text();
 
-  // Generate a signed per-page content token
   const pagePath = url.pathname;
   const ip = request.headers.get("cf-connecting-ip") || "";
-  const tokenData = { p: pagePath, ip: await sha256Short(ip), exp: Date.now() + 60000 }; // 60 second TTL
+  const tokenData = { p: pagePath, ip: await sha256Short(ip), exp: Date.now() + 60000 };
   const tokenB64 = btoa(JSON.stringify(tokenData));
   const tokenSig = await hmacSHA256(tokenB64, env.CHALLENGE_SECRET);
   const contentToken = `${tokenB64}.${tokenSig}`;
 
-  // Inject a content loader script before </body>
-  // This script will fetch the actual content using the token
   const loaderScript = `
 <script>
 (function(){
   var token = "${contentToken}";
   var containers = document.querySelectorAll("main, article, [role='main'], .content, .entry-content, .post-content");
-  if (containers.length === 0) return; // No content container found — SPA or non-article page
+  if (containers.length === 0) return;
   containers.forEach(function(el) {
     var placeholder = document.createElement("div");
     placeholder.innerHTML = '<div style="padding:20px;text-align:center;color:#94a3b8">Loading content...</div>';
@@ -1031,10 +1175,8 @@ async function forwardWithContentProtection(request, env, url) {
 })();
 </script>`;
 
-  // Strip main content from the HTML and inject the loader
   let protectedHtml = html;
 
-  // Try to strip content from common wrappers
   const contentPatterns = [
     /(<main[^>]*>)([\s\S]*?)(<\/main>)/i,
     /(<article[^>]*>)([\s\S]*?)(<\/article>)/i,
@@ -1042,16 +1184,13 @@ async function forwardWithContentProtection(request, env, url) {
     /(<div[^>]*class="[^"]*post-content[^"]*"[^>]*>)([\s\S]*?)(<\/div>)/i,
   ];
 
-  let contentStripped = false;
   for (const pattern of contentPatterns) {
     if (pattern.test(protectedHtml)) {
       protectedHtml = protectedHtml.replace(pattern, '$1<div style="padding:20px;text-align:center;color:#94a3b8">Loading...</div>$3');
-      contentStripped = true;
       break;
     }
   }
 
-  // Inject the loader script
   protectedHtml = protectedHtml.replace("</body>", loaderScript + "</body>");
 
   return new Response(protectedHtml, {
@@ -1066,7 +1205,6 @@ async function handleContentTokenRequest(request, url, env) {
     return new Response("Missing token", { status: 403 });
   }
 
-  // Verify token signature
   const parts = token.split(".");
   if (parts.length !== 2) {
     return new Response("Invalid token", { status: 403 });
@@ -1078,28 +1216,22 @@ async function handleContentTokenRequest(request, url, env) {
     return new Response("Invalid token signature", { status: 403 });
   }
 
-  // Decode and validate
   const tokenData = JSON.parse(atob(tokenB64));
 
-  // Check expiration (60 seconds)
   if (Date.now() > tokenData.exp) {
     return new Response("Token expired", { status: 403 });
   }
 
-  // Check IP binding
   const ip = request.headers.get("cf-connecting-ip") || "";
   const ipHash = await sha256Short(ip);
   if (tokenData.ip !== ipHash) {
     return new Response("Token IP mismatch", { status: 403 });
   }
 
-  // Check path binding
   if (tokenData.p !== url.pathname) {
     return new Response("Token path mismatch", { status: 403 });
   }
 
-  // Token valid — fetch and return the real content from origin
-  // Remove the token param so origin doesn't see it
   url.searchParams.delete("__gate_content_token");
   return forwardToOrigin(request, env);
 }
