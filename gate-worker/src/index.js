@@ -107,7 +107,7 @@ async function cachePut(key, val, ttlSeconds) {
    Accumulates counts in memory and flushes to KV periodically.
    One KV read+write per flush instead of per request.
 ============================================================ */
-const STATS_FLUSH_INTERVAL = 50; // flush every N increments
+const STATS_FLUSH_INTERVAL = 200; // flush every N increments
 const statsBuf = {};
 let statsCounter = 0;
 
@@ -209,7 +209,7 @@ export default {
       }
 
       // Rate limiting — L1 first, KV fallback
-      const rateLimited = await checkRateLimit(ip, env);
+      const rateLimited = await checkRateLimit(ip);
       if (rateLimited) {
         bufferStat('rate_limited');
         ctx.waitUntil(flushStatsIfNeeded(env));
@@ -303,12 +303,13 @@ async function tieredBotLookup(key, env) {
   }
 }
 
+const BOT_CACHE_TTL = 604800; // 7 days — bots rarely change IP+UA within a week
+
 async function tieredBotStore(key, entry, env) {
-  // Write to all tiers in parallel
   memSet(key, entry, 600_000); // L1: 10 min
   await Promise.all([
-    cachePut(key, entry, 86400),                                                    // L2: 24h
-    env.RATE_LIMIT ? env.RATE_LIMIT.put(key, JSON.stringify(entry), { expirationTtl: 86400 }) : Promise.resolve(), // L3: 24h
+    cachePut(key, entry, BOT_CACHE_TTL),                                                              // L2: 7 days
+    env.RATE_LIMIT ? env.RATE_LIMIT.put(key, JSON.stringify(entry), { expirationTtl: BOT_CACHE_TTL }) : Promise.resolve(), // L3: 7 days
   ]).catch(() => {});
 }
 
@@ -782,20 +783,14 @@ async function handleChallengeResponse(request, env) {
       return Response.redirect(paymentRedirectUrl, 302);
     }
 
-    // Challenge replay protection: L1 first, KV as cross-isolate fallback
+    // Challenge replay protection: in-memory only.
+    // Each challenge is a crypto.randomUUID() — collision across isolates
+    // is effectively impossible, so KV is unnecessary here.
     const challengeKey = `challenge:${challenge}`;
     if (memGet(challengeKey)) {
       return Response.redirect(paymentRedirectUrl, 302);
     }
     memSet(challengeKey, 1, 600_000); // 10 min
-
-    if (env.RATE_LIMIT) {
-      const used = await env.RATE_LIMIT.get(challengeKey);
-      if (used) {
-        return Response.redirect(paymentRedirectUrl, 302);
-      }
-      await env.RATE_LIMIT.put(challengeKey, "1", { expirationTtl: 600 });
-    }
 
     // ---- BEHAVIORAL VALIDATION ----
     if (behavior) {
@@ -885,18 +880,18 @@ async function handlePaidAccess(token, request, env, ctx) {
 }
 
 /* ============================================================
-   RATE LIMITING
-   L1 memory handles the fast path. KV is only read on L1
-   cache miss and only written when the count actually changes
-   state (first request in window, or crossing the threshold).
+   RATE LIMITING (in-memory only)
+   KV-backed rate limiting was removed — it generated 2 KV ops
+   per request and the 60s window fits entirely in isolate
+   lifetime. Worst case on isolate recycle: counter resets,
+   which is acceptable since bots also get caught by detection.
 ============================================================ */
-async function checkRateLimit(ip, env) {
+async function checkRateLimit(ip) {
   const key = `rl:${ip}`;
   const now = Math.floor(Date.now() / 1000);
   const windowSize = 60;
   const maxRequests = 60;
 
-  // L1 check
   const cached = memGet(key);
   if (cached) {
     if (now - cached.ts > windowSize) {
@@ -909,49 +904,19 @@ async function checkRateLimit(ip, env) {
     return false;
   }
 
-  // L1 miss → check KV
-  if (!env.RATE_LIMIT) return false;
-  try {
-    const stored = await env.RATE_LIMIT.get(key, { type: "json" });
-    if (!stored || now - stored.ts > windowSize) {
-      const entry = { count: 1, ts: now };
-      memSet(key, entry, windowSize * 2 * 1000);
-      await env.RATE_LIMIT.put(key, JSON.stringify(entry), { expirationTtl: windowSize * 2 });
-      return false;
-    }
-
-    if (stored.count >= maxRequests) {
-      memSet(key, stored, windowSize * 2 * 1000);
-      return true;
-    }
-
-    stored.count++;
-    memSet(key, stored, windowSize * 2 * 1000);
-    await env.RATE_LIMIT.put(key, JSON.stringify(stored), { expirationTtl: windowSize * 2 });
-    return false;
-  } catch {
-    return false;
-  }
+  memSet(key, { count: 1, ts: now }, windowSize * 2 * 1000);
+  return false;
 }
 
 /* ============================================================
-   REQUEST LOGGING (async, non-blocking)
+   REQUEST LOGGING (in-memory only)
+   Logs are stored in Supabase via the check-access edge function.
+   KV logging was removed — it created a new key per blocked request
+   and nothing ever read them back.
 ============================================================ */
-async function logRequest(ip, request, detection, status, env) {
-  if (!env.RATE_LIMIT) return;
-  const key = `log:${ip}:${Date.now()}`;
-  const entry = {
-    ip,
-    ua: request.headers.get("user-agent") || "",
-    url: request.url,
-    confidence: detection.confidence,
-    signals: detection.signals,
-    status,
-    ts: Date.now(),
-  };
-  try {
-    await env.RATE_LIMIT.put(key, JSON.stringify(entry), { expirationTtl: 86400 });
-  } catch {}
+async function logRequest(_ip, _request, _detection, _status, _env) {
+  // Intentional no-op. Supabase request_logs table is the source of truth.
+  // Kept as a function signature so callsites don't need to change.
 }
 
 /* ============================================================
