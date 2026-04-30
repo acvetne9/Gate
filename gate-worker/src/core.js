@@ -109,7 +109,48 @@ export function detectBot(request) {
   }
 
   const confidence = Math.min(score, 100);
-  return { isBot: confidence >= 50, confidence, signals };
+  const blockType = classifyBlockType(ua, signals);
+  return { isBot: confidence >= 50, confidence, signals, blockType };
+}
+
+// ============================================================
+// BLOCK TYPE CLASSIFICATION
+// Obvious non-renderable bots get a hard 403. Bots that could
+// plausibly pay (AI crawlers) get redirected to payment.
+// ============================================================
+const HTTP_LIBRARY_PATTERNS = [
+  /^curl\//i, /^wget\//i, /^python-requests/i, /^python-urllib/i,
+  /^httpx/i, /^aiohttp/i, /^go-http-client/i, /^java\//i,
+  /^libwww/i, /^apache-httpclient/i, /^node-fetch/i, /^axios/i,
+  /^got\//i, /^okhttp/i, /^PHP\//i, /^ruby/i, /^perl/i,
+  /^scrapy/i, /^beautifulsoup/i, /^superagent/i,
+];
+
+const HEADLESS_PATTERNS = [
+  /headlesschrome/i, /phantomjs/i, /puppeteer/i, /playwright/i, /selenium/i,
+];
+
+export function classifyBlockType(ua, signals) {
+  // Empty UA — not a browser, can't render anything
+  if (!ua || ua.length === 0) return "hard_block";
+
+  // HTTP libraries — can't render a payment page
+  for (const pattern of HTTP_LIBRARY_PATTERNS) {
+    if (pattern.test(ua)) return "hard_block";
+  }
+
+  // Headless browsers — automated, should not get payment option
+  for (const pattern of HEADLESS_PATTERNS) {
+    if (pattern.test(ua)) return "hard_block";
+  }
+
+  // Datacenter IP + bot UA = scraping infrastructure, not a user
+  if (signals.includes("datacenter_asn") && signals.includes("ua_bot_pattern")) {
+    return "hard_block";
+  }
+
+  // Everything else (GPTBot, ClaudeBot, etc.) could plausibly pay
+  return "payment_redirect";
 }
 
 // ============================================================
@@ -153,6 +194,26 @@ export function validateBehavior(behavior) {
   }
 
   return { valid: failures.length === 0, failures };
+}
+
+// ============================================================
+// HUMAN CONFIDENCE SCORING
+// Determines how strongly a visitor proved they're human based
+// on behavioral signals collected during the challenge page.
+// ============================================================
+export function computeHumanConfidence(behavior) {
+  if (!behavior) return "weak";
+
+  const hasMouseActivity = behavior.mouse > 10;
+  const hasTouchActivity = behavior.touch > 3;
+  const hasInteraction = hasMouseActivity || hasTouchActivity;
+  const hasVariance = behavior.moveVarianceX > 100 || behavior.moveVarianceY > 100 || hasTouchActivity;
+  const hasTimeOnPage = behavior.timeOnPage > 2000;
+  const hasScroll = behavior.scroll > 0;
+
+  if (hasInteraction && hasVariance && hasTimeOnPage && hasScroll) return "strong";
+  if (hasInteraction || hasTimeOnPage) return "moderate";
+  return "weak";
 }
 
 // ============================================================

@@ -192,6 +192,22 @@ export default {
         return handleStatsRequest(env);
       }
 
+      // Honeypot trap — any request to /__gate_hp_ is a guaranteed bot
+      if (url.pathname.startsWith("/__gate_hp_")) {
+        const hpIp = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown";
+        const hpUa = request.headers.get("user-agent") || "";
+        const hpKey = `bot:${await sha256Short(hpIp + "|" + hpUa)}`;
+        const siteId = getSiteId(env, request);
+        const hpEntry = {
+          isBot: true, confidence: 100, blockType: "hard_block",
+          signals: ["honeypot_triggered"], cachedAt: Date.now(),
+          sites: { [siteId]: Date.now() },
+        };
+        bufferStat('honeypots_triggered');
+        ctx.waitUntil(Promise.all([tieredBotStore(hpKey, hpEntry, env), flushStatsIfNeeded(env)]));
+        return serveHardBlock();
+      }
+
       const ip = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown";
 
       // Check for valid signed challenge cookie (humans who already passed).
@@ -231,31 +247,63 @@ export default {
       const botKey = `bot:${await sha256Short(ip + "|" + ua)}`;
       const knownBot = await tieredBotLookup(botKey, env);
       if (knownBot) {
+        const siteId = getSiteId(env, request);
+        if (!knownBot.sites || !knownBot.sites[siteId]) {
+          const enriched = enrichBotEntry(knownBot, knownBot, siteId);
+          ctx.waitUntil(tieredBotStore(botKey, enriched, env));
+        }
         bufferStat('bots_blocked');
-        ctx.waitUntil(Promise.all([
-          logRequest(ip, request, knownBot, "blocked_cached", env),
-          flushStatsIfNeeded(env),
-        ]));
+        ctx.waitUntil(flushStatsIfNeeded(env));
+        const bt = knownBot.blockType || "payment_redirect";
+        if (bt === "hard_block") return serveHardBlock();
         return redirectToPayment(url, "known_bot", knownBot);
+      }
+
+      // SEO bot DNS verification — check before running full detection.
+      // Only fires when UA matches a search engine pattern.
+      const seoResult = await verifySearchEngineBot(ip, ua);
+      if (seoResult.verified) {
+        bufferStat('seo_bots_verified');
+        ctx.waitUntil(flushStatsIfNeeded(env));
+        return forwardToOrigin(request, env);
+      }
+      if (seoResult.spoofed) {
+        const siteId = getSiteId(env, request);
+        const cacheEntry = {
+          isBot: true, confidence: 95, blockType: "payment_redirect",
+          signals: ["spoofed_search_engine", `claimed_${seoResult.engine}`],
+          cachedAt: Date.now(), sites: { [siteId]: Date.now() },
+        };
+        bufferStat('bots_blocked');
+        ctx.waitUntil(Promise.all([tieredBotStore(botKey, cacheEntry, env), flushStatsIfNeeded(env)]));
+        return redirectToPayment(url, "spoofed_bot", { confidence: 95, signals: cacheEntry.signals });
       }
 
       // Run bot detection
       const detection = detectBot(request);
 
-      // Definite bot → cache across all tiers, redirect to payment
+      // Definite bot → cache across all tiers, block or redirect to payment
       if (detection.isBot && detection.confidence >= 80) {
-        const cacheEntry = {
+        const siteId = getSiteId(env, request);
+        let cacheEntry = {
           isBot: true,
           confidence: detection.confidence,
+          blockType: detection.blockType,
           signals: detection.signals,
           cachedAt: Date.now(),
+          sites: { [siteId]: Date.now() },
         };
+        // Enrich with existing cross-site data if available
+        const existingBot = await tieredBotLookup(botKey, env);
+        if (existingBot) {
+          cacheEntry = enrichBotEntry(existingBot, cacheEntry, siteId);
+        }
         bufferStat('bots_blocked');
         ctx.waitUntil(Promise.all([
           tieredBotStore(botKey, cacheEntry, env),
-          logRequest(ip, request, detection, "blocked", env),
           flushStatsIfNeeded(env),
         ]));
+        if (cacheEntry.blockType === "hard_block") return serveHardBlock();
         return redirectToPayment(url, "bot_detected", detection);
       }
 
@@ -311,6 +359,175 @@ async function tieredBotStore(key, entry, env) {
     cachePut(key, entry, BOT_CACHE_TTL),                                                              // L2: 7 days
     env.RATE_LIMIT ? env.RATE_LIMIT.put(key, JSON.stringify(entry), { expirationTtl: BOT_CACHE_TTL }) : Promise.resolve(), // L3: 7 days
   ]).catch(() => {});
+}
+
+/* ============================================================
+   HARD BLOCK RESPONSE
+   For obvious bots that can't render a payment page anyway.
+============================================================ */
+function serveHardBlock() {
+  return new Response(
+    "Access denied. Automated access is not permitted.\n\nFor legitimate bot access, visit https://securitygate.app",
+    { status: 403, headers: { "Content-Type": "text/plain", "X-Robots-Tag": "noindex" } }
+  );
+}
+
+/* ============================================================
+   SEO BOT DNS VERIFICATION
+   Confirms Googlebot/Bingbot identity via reverse+forward DNS.
+   Uses Cloudflare DoH (free, fast from Workers).
+============================================================ */
+const SEARCH_ENGINE_DNS = {
+  googlebot:    { ua: /googlebot/i,    dns: [".googlebot.com", ".google.com"] },
+  bingbot:      { ua: /bingbot/i,      dns: [".search.msn.com"] },
+  yandexbot:    { ua: /yandexbot/i,    dns: [".yandex.ru", ".yandex.net", ".yandex.com"] },
+};
+
+async function verifySearchEngineBot(ip, ua) {
+  const noMatch = { verified: false, engine: null, spoofed: false };
+  const lowerUa = ua.toLowerCase();
+
+  // Find which engine this UA claims to be
+  let engine = null;
+  let dnsEndings = null;
+  for (const [name, config] of Object.entries(SEARCH_ENGINE_DNS)) {
+    if (config.ua.test(lowerUa)) {
+      engine = name;
+      dnsEndings = config.dns;
+      break;
+    }
+  }
+  if (!engine) return noMatch;
+
+  // Check L1/L2 cache
+  const cacheKey = `dns:${await sha256Short(ip)}`;
+  const cached = memGet(cacheKey) || await cacheGet(cacheKey);
+  if (cached) return cached;
+
+  try {
+    // Reverse DNS: IP → hostname
+    const hostname = await reverseDnsLookup(ip);
+    if (!hostname) {
+      const result = { verified: false, engine, spoofed: true };
+      memSet(cacheKey, result, 600_000);
+      cachePut(cacheKey, result, 86400).catch(() => {});
+      return result;
+    }
+
+    // Check hostname ends with an allowed domain
+    const hostLower = hostname.toLowerCase().replace(/\.$/, "");
+    const dnsMatch = dnsEndings.some(ending => hostLower.endsWith(ending));
+    if (!dnsMatch) {
+      const result = { verified: false, engine, spoofed: true, hostname: hostLower };
+      memSet(cacheKey, result, 600_000);
+      cachePut(cacheKey, result, 86400).catch(() => {});
+      return result;
+    }
+
+    // Forward DNS: hostname → IPs (confirm the IP matches)
+    const ips = await forwardDnsLookup(hostLower);
+    const verified = ips.includes(ip);
+    const result = { verified, engine, spoofed: !verified, hostname: hostLower };
+    memSet(cacheKey, result, 600_000);
+    cachePut(cacheKey, result, 86400).catch(() => {});
+    return result;
+  } catch {
+    // DNS failure → fall through to normal detection (fail open)
+    return noMatch;
+  }
+}
+
+async function reverseDnsLookup(ip) {
+  try {
+    const reversed = ip.split(".").reverse().join(".");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2000);
+    const res = await fetch(
+      `https://cloudflare-dns.com/dns-query?name=${reversed}.in-addr.arpa&type=PTR`,
+      { headers: { "Accept": "application/dns-json" }, signal: controller.signal }
+    );
+    clearTimeout(timeout);
+    const data = await res.json();
+    if (data.Answer && data.Answer.length > 0) {
+      return data.Answer[0].data;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function forwardDnsLookup(hostname) {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2000);
+    const res = await fetch(
+      `https://cloudflare-dns.com/dns-query?name=${hostname}&type=A`,
+      { headers: { "Accept": "application/dns-json" }, signal: controller.signal }
+    );
+    clearTimeout(timeout);
+    const data = await res.json();
+    if (data.Answer) {
+      return data.Answer.map(a => a.data);
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+/* ============================================================
+   HONEYPOT LINK INJECTION
+   Generates invisible links that only bots follow.
+============================================================ */
+function generateHoneypotHTML() {
+  const anchors = ["View pricing", "Related articles", "Download PDF"];
+  return anchors.map((text, i) => {
+    const path = `/__gate_hp_${crypto.randomUUID().slice(0, 8)}`;
+    return `<a href="${path}" style="position:absolute;left:-9999px;opacity:0;height:0;width:0;overflow:hidden" aria-hidden="true" tabindex="-1" rel="nofollow">${text}</a>`;
+  }).join("\n");
+}
+
+/* ============================================================
+   MULTI-SITE INTELLIGENCE
+   Enriches bot cache entries when the same bot is seen across
+   multiple sites. Boosts confidence for systematic crawlers.
+============================================================ */
+function getSiteId(env, request) {
+  return env.SITE_ID || new URL(request.url).hostname;
+}
+
+function enrichBotEntry(existing, incoming, siteId) {
+  const sites = { ...(existing.sites || {}), ...(incoming.sites || {}), [siteId]: Date.now() };
+
+  // Cap sites at 20 entries (keep most recent)
+  const siteEntries = Object.entries(sites);
+  const trimmedSites = siteEntries.length > 20
+    ? Object.fromEntries(siteEntries.sort((a, b) => b[1] - a[1]).slice(0, 20))
+    : sites;
+
+  const siteCount = Object.keys(trimmedSites).length;
+  const multiSiteBoost = Math.min((siteCount - 1) * 10, 30);
+  const baseConfidence = Math.max(existing.confidence || 0, incoming.confidence || 0);
+
+  // Merge signals, deduplicate
+  const allSignals = [...new Set([...(existing.signals || []), ...(incoming.signals || [])])];
+  if (siteCount >= 3 && !allSignals.includes("multi_site_crawler")) {
+    allSignals.push("multi_site_crawler");
+  }
+
+  // Keep most restrictive blockType
+  const blockType = (existing.blockType === "hard_block" || incoming.blockType === "hard_block")
+    ? "hard_block" : "payment_redirect";
+
+  return {
+    isBot: true,
+    confidence: Math.min(baseConfidence + multiSiteBoost, 100),
+    blockType,
+    signals: allSignals,
+    cachedAt: Date.now(),
+    sites: trimmedSites,
+  };
 }
 
 /* ============================================================
@@ -445,11 +662,38 @@ function detectBot(request) {
   }
 
   const confidence = Math.min(score, 100);
-  return {
-    isBot: confidence >= 50,
-    confidence,
-    signals,
-  };
+  const blockType = classifyBlockType(ua, signals);
+  return { isBot: confidence >= 50, confidence, signals, blockType };
+}
+
+const HARD_BLOCK_HTTP_LIBS = [
+  /^curl\//i, /^wget\//i, /^python-requests/i, /^python-urllib/i,
+  /^httpx/i, /^aiohttp/i, /^go-http-client/i, /^java\//i,
+  /^libwww/i, /^apache-httpclient/i, /^node-fetch/i, /^axios/i,
+  /^got\//i, /^okhttp/i, /^PHP\//i, /^ruby/i, /^perl/i,
+  /^scrapy/i, /^beautifulsoup/i, /^superagent/i,
+];
+const HARD_BLOCK_HEADLESS = [
+  /headlesschrome/i, /phantomjs/i, /puppeteer/i, /playwright/i, /selenium/i,
+];
+
+function classifyBlockType(ua, signals) {
+  if (!ua || ua.length === 0) return "hard_block";
+  for (const p of HARD_BLOCK_HTTP_LIBS) { if (p.test(ua)) return "hard_block"; }
+  for (const p of HARD_BLOCK_HEADLESS) { if (p.test(ua)) return "hard_block"; }
+  if (signals.includes("datacenter_asn") && signals.includes("ua_bot_pattern")) return "hard_block";
+  return "payment_redirect";
+}
+
+function computeHumanConfidence(behavior) {
+  if (!behavior) return "weak";
+  const hasInteraction = behavior.mouse > 10 || behavior.touch > 3;
+  const hasVariance = behavior.moveVarianceX > 100 || behavior.moveVarianceY > 100 || behavior.touch > 3;
+  const hasTime = behavior.timeOnPage > 2000;
+  const hasScroll = behavior.scroll > 0;
+  if (hasInteraction && hasVariance && hasTime && hasScroll) return "strong";
+  if (hasInteraction || hasTime) return "moderate";
+  return "weak";
 }
 
 /* ============================================================
@@ -498,19 +742,22 @@ async function verifyChallengeCookie(request, env, ip) {
   }
 }
 
-async function createChallengeCookie(request, env) {
+const TRUST_TTL = { strong: 7 * 86400, moderate: 86400, weak: 12 * 3600 };
+
+async function createChallengeCookie(request, env, trustLevel = "moderate") {
   const ip = request.headers.get("cf-connecting-ip") || "";
   const ipHash = await sha256Short(ip);
   const uaHash = await sha256Short(request.headers.get("user-agent") || "");
-  const ttl = 86400 * 1000; // 24 hours
+  const maxAge = TRUST_TTL[trustLevel] || TRUST_TTL.moderate;
+  const ttl = maxAge * 1000;
 
-  const payload = { ip: ipHash, ua: uaHash };
+  const payload = { ip: ipHash, ua: uaHash, trust: trustLevel };
   const payloadB64 = btoa(JSON.stringify(payload));
   const expB64 = btoa(String(Date.now() + ttl));
   const sig = await hmacSHA256(`${payloadB64}.${expB64}`, env.CHALLENGE_SECRET);
 
   const cookieValue = `${payloadB64}.${expB64}.${sig}`;
-  return `__gate_verified=${cookieValue}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400`;
+  return `__gate_verified=${cookieValue}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
 }
 
 /* ============================================================
@@ -817,8 +1064,9 @@ async function handleChallengeResponse(request, env) {
       }
     }
 
-    // Issue signed cookie
-    const cookie = await createChallengeCookie(request, env);
+    // Issue signed cookie — trust level based on behavioral evidence
+    const trustLevel = computeHumanConfidence(behavior);
+    const cookie = await createChallengeCookie(request, env, trustLevel);
 
     return new Response("OK", {
       status: 200,
@@ -1156,7 +1404,9 @@ async function forwardWithContentProtection(request, env, url) {
     }
   }
 
-  protectedHtml = protectedHtml.replace("</body>", loaderScript + "</body>");
+  // Inject honeypot links (invisible to humans, followed by bots)
+  const honeypotHtml = generateHoneypotHTML();
+  protectedHtml = protectedHtml.replace("</body>", honeypotHtml + loaderScript + "</body>");
 
   return new Response(protectedHtml, {
     status: originResponse.status,

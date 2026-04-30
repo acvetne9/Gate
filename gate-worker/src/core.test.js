@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   isStaticAsset,
   detectBot,
+  classifyBlockType,
+  computeHumanConfidence,
   validateFingerprint,
   validateBehavior,
   parseCookies,
@@ -394,5 +396,121 @@ describe('ipTo24', () => {
     expect(ipTo24('::1')).toBeNull();
     expect(ipTo24(null)).toBeNull();
     expect(ipTo24('')).toBeNull();
+  });
+});
+
+// ============================================================
+// classifyBlockType
+// ============================================================
+describe('classifyBlockType', () => {
+  it('hard-blocks HTTP libraries', () => {
+    expect(classifyBlockType('curl/7.64.1', [])).toBe('hard_block');
+    expect(classifyBlockType('python-requests/2.28.0', [])).toBe('hard_block');
+    expect(classifyBlockType('wget/1.21', [])).toBe('hard_block');
+    expect(classifyBlockType('Go-http-client/1.1', [])).toBe('hard_block');
+    expect(classifyBlockType('node-fetch/2.6.7', [])).toBe('hard_block');
+    expect(classifyBlockType('axios/1.4.0', [])).toBe('hard_block');
+    expect(classifyBlockType('Scrapy/2.8.0', [])).toBe('hard_block');
+  });
+
+  it('hard-blocks headless browsers', () => {
+    expect(classifyBlockType('Mozilla/5.0 HeadlessChrome/120.0', [])).toBe('hard_block');
+    expect(classifyBlockType('PhantomJS/2.1.1', [])).toBe('hard_block');
+    expect(classifyBlockType('puppeteer-extra', [])).toBe('hard_block');
+    expect(classifyBlockType('playwright/1.40.0', [])).toBe('hard_block');
+  });
+
+  it('hard-blocks empty user-agent', () => {
+    expect(classifyBlockType('', [])).toBe('hard_block');
+    expect(classifyBlockType(null, [])).toBe('hard_block');
+  });
+
+  it('hard-blocks datacenter ASN + bot UA combo', () => {
+    expect(classifyBlockType('SomeBot/1.0', ['datacenter_asn', 'ua_bot_pattern'])).toBe('hard_block');
+  });
+
+  it('payment-redirects AI crawlers', () => {
+    expect(classifyBlockType('Mozilla/5.0 (compatible; GPTBot/1.0)', ['ua_bot_pattern'])).toBe('payment_redirect');
+    expect(classifyBlockType('ClaudeBot/1.0', ['ua_bot_pattern'])).toBe('payment_redirect');
+    expect(classifyBlockType('CCBot/2.0', ['ua_bot_pattern'])).toBe('payment_redirect');
+  });
+
+  it('payment-redirects search engine bots', () => {
+    expect(classifyBlockType('Googlebot/2.1', ['ua_bot_pattern'])).toBe('payment_redirect');
+    expect(classifyBlockType('Mozilla/5.0 (compatible; bingbot/2.0)', ['ua_bot_pattern'])).toBe('payment_redirect');
+  });
+});
+
+// ============================================================
+// detectBot — blockType field
+// ============================================================
+describe('detectBot blockType', () => {
+  it('returns hard_block for curl', () => {
+    const req = mockRequest('https://example.com/', { 'user-agent': 'curl/7.64.1' });
+    const result = detectBot(req);
+    expect(result.blockType).toBe('hard_block');
+    expect(result.confidence).toBeGreaterThanOrEqual(50);
+  });
+
+  it('returns payment_redirect for GPTBot', () => {
+    const req = mockRequest('https://example.com/', { 'user-agent': 'Mozilla/5.0 (compatible; GPTBot/1.0)' });
+    const result = detectBot(req);
+    expect(result.blockType).toBe('payment_redirect');
+  });
+
+  it('returns payment_redirect for normal browser', () => {
+    const req = mockRequest('https://example.com/', {
+      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+      'accept-language': 'en-US,en;q=0.9',
+      'accept': 'text/html',
+      'sec-ch-ua': '"Chromium";v="120"',
+      'sec-fetch-mode': 'navigate',
+    });
+    const result = detectBot(req);
+    expect(result.blockType).toBe('payment_redirect');
+  });
+});
+
+// ============================================================
+// computeHumanConfidence
+// ============================================================
+describe('computeHumanConfidence', () => {
+  it('returns strong for rich behavioral signals', () => {
+    expect(computeHumanConfidence({
+      mouse: 25, scroll: 3, touch: 0, keys: 0, clicks: 2,
+      moveVarianceX: 500, moveVarianceY: 300, timeOnPage: 5000, samples: 20,
+    })).toBe('strong');
+  });
+
+  it('returns strong for mobile touch users', () => {
+    expect(computeHumanConfidence({
+      mouse: 0, scroll: 2, touch: 5, keys: 0, clicks: 0,
+      moveVarianceX: 0, moveVarianceY: 0, timeOnPage: 4000, samples: 0,
+    })).toBe('strong');
+  });
+
+  it('returns moderate for minimal but present interaction', () => {
+    expect(computeHumanConfidence({
+      mouse: 15, scroll: 0, touch: 0, keys: 0, clicks: 0,
+      moveVarianceX: 50, moveVarianceY: 30, timeOnPage: 1000, samples: 5,
+    })).toBe('moderate');
+  });
+
+  it('returns moderate for slow page load with time', () => {
+    expect(computeHumanConfidence({
+      mouse: 0, scroll: 0, touch: 0, keys: 0, clicks: 0,
+      moveVarianceX: 0, moveVarianceY: 0, timeOnPage: 3000, samples: 0,
+    })).toBe('moderate');
+  });
+
+  it('returns weak for null behavior', () => {
+    expect(computeHumanConfidence(null)).toBe('weak');
+  });
+
+  it('returns weak for zero interaction and fast solve', () => {
+    expect(computeHumanConfidence({
+      mouse: 0, scroll: 0, touch: 0, keys: 0, clicks: 0,
+      moveVarianceX: 0, moveVarianceY: 0, timeOnPage: 500, samples: 0,
+    })).toBe('weak');
   });
 });
