@@ -205,7 +205,7 @@ export default {
         };
         bufferStat('honeypots_triggered');
         ctx.waitUntil(Promise.all([tieredBotStore(hpKey, hpEntry, env), flushStatsIfNeeded(env)]));
-        return serveHardBlock();
+        return serveHardBlock(url);
       }
 
       const ip = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown";
@@ -255,7 +255,7 @@ export default {
         bufferStat('bots_blocked');
         ctx.waitUntil(flushStatsIfNeeded(env));
         const bt = knownBot.blockType || "payment_redirect";
-        if (bt === "hard_block") return serveHardBlock();
+        if (bt === "hard_block") return serveHardBlock(url);
         return redirectToPayment(url, "known_bot", knownBot);
       }
 
@@ -303,7 +303,7 @@ export default {
           tieredBotStore(botKey, cacheEntry, env),
           flushStatsIfNeeded(env),
         ]));
-        if (cacheEntry.blockType === "hard_block") return serveHardBlock();
+        if (cacheEntry.blockType === "hard_block") return serveHardBlock(url);
         return redirectToPayment(url, "bot_detected", detection);
       }
 
@@ -363,12 +363,23 @@ async function tieredBotStore(key, entry, env) {
 
 /* ============================================================
    HARD BLOCK RESPONSE
-   For obvious bots that can't render a payment page anyway.
+   Returns a 402 with the payment URL in both the body and a
+   Link header so HTTP libraries and headless browsers can
+   programmatically discover how to pay for access.
 ============================================================ */
-function serveHardBlock() {
+function serveHardBlock(url) {
+  const paymentUrl = `https://securitygate.app/bot-payment?return_to=${encodeURIComponent(url ? url.toString() : "")}&reason=bot_detected`;
   return new Response(
-    "Access denied. Automated access is not permitted.\n\nFor legitimate bot access, visit https://securitygate.app",
-    { status: 403, headers: { "Content-Type": "text/plain", "X-Robots-Tag": "noindex" } }
+    `HTTP 402 — Payment Required\n\nAutomated access to this site requires a paid token.\nPurchase access: ${paymentUrl}\n`,
+    {
+      status: 402,
+      headers: {
+        "Content-Type": "text/plain",
+        "X-Robots-Tag": "noindex",
+        "Link": `<${paymentUrl}>; rel="payment"`,
+        "X-Gate-Payment-URL": paymentUrl,
+      },
+    }
   );
 }
 
